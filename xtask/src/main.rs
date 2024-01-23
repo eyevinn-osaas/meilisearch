@@ -17,12 +17,14 @@ struct ListFeaturesDeriveArgs {
 #[command(bin_name = "cargo xtask")]
 enum Command {
     ListFeatures(ListFeaturesDeriveArgs),
+    Bench(BenchDeriveArgs),
 }
 
 fn main() {
     let args = Command::parse();
     match args {
         Command::ListFeatures(args) => list_features(args),
+        Command::Bench(args) => xtask::bench::run(args),
     }
 }
 
