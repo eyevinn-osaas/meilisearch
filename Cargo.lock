@@ -6643,6 +6643,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tracing-trace",
 ]
 
 [[package]]

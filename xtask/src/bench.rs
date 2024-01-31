@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -17,7 +17,7 @@ pub fn default_http_addr() -> String {
     "127.0.0.1:7700".to_string()
 }
 pub fn default_report_folder() -> String {
-    "./report/".into()
+    "./reports/".into()
 }
 
 pub fn default_asset_folder() -> String {
@@ -78,9 +78,14 @@ pub struct Command {
 }
 
 #[derive(Default, Clone, Deserialize)]
+#[serde(untagged)]
 pub enum Body {
-    Inline(serde_json::Value),
-    Asset(String),
+    Inline {
+        inline: serde_json::Value,
+    },
+    Asset {
+        asset: String,
+    },
     #[default]
     Empty,
 }
@@ -92,8 +97,8 @@ impl Body {
         asset_folder: &str,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         Ok(match self {
-            Body::Inline(body) => Some(body),
-            Body::Asset(name) => Some({
+            Body::Inline { inline: body } => Some(body),
+            Body::Asset { asset: name } => Some({
                 let file: std::fs::File = fetch_asset(&name, assets, asset_folder)
                     .with_context(|| format!("while getting body from asset '{name}'"))?;
                 serde_json::from_reader(file)
@@ -154,6 +159,21 @@ pub enum SyncMode {
     WaitForTask,
 }
 
+fn new_client(
+    master_key: &str,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {master_key}"))
+            .context("Invalid authorization header")?,
+    );
+    let client = reqwest::ClientBuilder::new().default_headers(headers);
+    let client = if let Some(timeout) = timeout { client.timeout(timeout) } else { client };
+    Ok(client.build()?)
+}
+
 pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let filter: tracing_subscriber::filter::Targets =
         args.log_filter.parse().context("invalid --log-filter")?;
@@ -168,16 +188,7 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
 
     let master_key = meilisearch_auth::generate_master_key();
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.append(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {master_key}"))
-            .context("Invalid authorization header")?,
-    );
-    let client = reqwest::ClientBuilder::new()
-        .default_headers(headers)
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
+    let client = new_client(&master_key, Some(std::time::Duration::from_secs(60)))?;
 
     rt.block_on(async {
         tracing::info!(workload_count = args.workload_file.len(), "handling workload files");
@@ -193,6 +204,8 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
 
+    tracing::info!("Success");
+
     Ok(())
 }
 
@@ -205,9 +218,20 @@ async fn run_workload(
 ) -> anyhow::Result<()> {
     fetch_assets(client, &workload.assets, &args.asset_folder).await?;
 
+    let mut tasks = Vec::new();
+
     for i in 0..workload.run_count {
-        run_workload_run(client, master_key, &workload, args, i).await?
+        tasks.push(run_workload_run(client, master_key, &workload, args, i).await?);
     }
+
+    for task in tasks {
+        task.await
+            .context("task panicked while processing report")?
+            .context("task failed while processing report")?;
+    }
+
+    tracing::info!(workload = workload.name, "Successful workload");
+
     Ok(())
 }
 
@@ -349,15 +373,17 @@ async fn run_workload_run(
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
-) -> anyhow::Result<()> {
-    delete_db()?;
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    delete_db();
     build_meilisearch().await?;
     let meilisearch = start_meilisearch(client, master_key, workload, &args.asset_folder).await?;
-    run_commands(client, workload, args, run_number).await?;
+    let processor = run_commands(client, master_key, workload, args, run_number).await?;
 
     kill_meilisearch(meilisearch).await;
 
-    Ok(())
+    tracing::info!(run_number, "Successful run");
+
+    Ok(processor)
 }
 
 async fn kill_meilisearch(mut meilisearch: tokio::process::Child) {
@@ -458,19 +484,27 @@ fn health_command() -> Command {
     }
 }
 
-fn delete_db() -> anyhow::Result<()> {
+fn delete_db() {
     let _ = std::fs::remove_dir_all("./_xtask_benchmark.ms");
-    Ok(())
 }
 
 async fn run_commands(
     client: &reqwest::Client,
+    master_key: &str,
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
-) -> anyhow::Result<()> {
-    let report_handle =
-        start_report(client, &workload.name, &args.report_folder, run_number).await?;
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let report_folder = &args.report_folder;
+    let workload_name = &workload.name;
+
+    std::fs::create_dir_all(report_folder)
+        .with_context(|| format!("could not create report directory at {report_folder}"))?;
+
+    let trace_filename = format!("{report_folder}/{workload_name}-{run_number}-trace.json");
+    let report_filename = format!("{report_folder}/{workload_name}-{run_number}-report.json");
+
+    let report_handle = start_report(master_key, trace_filename).await?;
 
     for batch in workload
         .commands
@@ -480,39 +514,71 @@ async fn run_commands(
         run_batch(client, batch, &workload.assets, &args.asset_folder).await?;
     }
 
-    stop_report(client, report_handle).await?;
+    let processor = stop_report(client, report_filename, report_handle).await?;
 
-    Ok(())
+    Ok(processor)
 }
 
 async fn stop_report(
     client: &reqwest::Client,
-    report_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-) -> anyhow::Result<()> {
-    client.delete(url_of("logs")).send().await.context("while stopping report")?;
+    filename: String,
+    report_handle: tokio::task::JoinHandle<anyhow::Result<std::fs::File>>,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let response = client.delete(url_of("logs")).send().await.context("while stopping report")?;
+    if !response.status().is_success() {
+        bail!("received HTTP {} while stopping report", response.status())
+    }
 
-    tokio::time::timeout(std::time::Duration::from_secs(60), report_handle)
+    let mut file = tokio::time::timeout(std::time::Duration::from_secs(1000), report_handle)
         .await
         .context("while waiting for the end of the report")?
         .context("report writing task panicked")?
         .context("while writing report")?;
 
-    Ok(())
+    file.rewind().context("while rewinding report file")?;
+
+    let process_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let span = tracing::info_span!("processing trace to report", filename);
+        let _guard = span.enter();
+        let report = tracing_trace::processor::span_stats::to_call_stats(
+            tracing_trace::TraceReader::new(std::io::BufReader::new(file)),
+        )
+        .context("could not convert trace to report")?;
+
+        let mut output_file = std::io::BufWriter::new(std::fs::File::create(&filename).unwrap());
+        let context = || format!("writing report to {filename}");
+
+        for (key, value) in report {
+            serde_json::to_writer(&mut output_file, &json!({key: value}))
+                .context("serializing span stat")?;
+            writeln!(&mut output_file).with_context(context)?;
+        }
+        output_file.flush().with_context(context)?;
+        tracing::info!("success");
+
+        Ok(())
+    });
+
+    Ok(process_handle)
 }
 
 async fn start_report(
-    client: &reqwest::Client,
-    workload_name: &str,
-    report_folder: &str,
-    run_number: u16,
-) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
-    std::fs::create_dir_all(report_folder)
-        .with_context(|| format!("could not create report directory at {report_folder}"))?;
-
-    let filename = format!("{report_folder}/{workload_name}-{run_number}-report.json");
-    let report_file = std::fs::File::create(&filename)
+    master_key: &str,
+    filename: String,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
+    let report_file = std::fs::File::options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .open(&filename)
         .with_context(|| format!("could not create file at {filename}"))?;
     let mut report_file = std::io::BufWriter::new(report_file);
+
+    // reporting uses its own client because keeping the stream open to wait for entries
+    // blocks any other requests
+    // Also we don't want any pesky timeout because we don't know how much time it will take to recover the full trace
+    let client = new_client(master_key, None)?;
 
     let response = client
         .post(url_of("logs"))
@@ -546,8 +612,7 @@ async fn start_report(
                 .write_all(&bytes)
                 .with_context(|| format!("while writing report to {filename}"))?;
         }
-        report_file.flush().with_context(|| format!("while writing report to {filename}"))?;
-        Ok(())
+        report_file.into_inner().with_context(|| format!("while writing report to {filename}"))
     }))
 }
 
