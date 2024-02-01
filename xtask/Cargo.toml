@@ -16,11 +16,14 @@ cargo_metadata = "0.18.1"
 clap = { version = "4.4.14", features = ["derive"] }
 futures-core = "0.3.30"
 futures-util = "0.3.30"
+git2 = "0.16"
 meilisearch-auth = { version = "1.6.0", path = "../meilisearch-auth" }
 reqwest = { version = "0.11.23", features = ["stream"] }
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
 sha2 = "0.10.8"
+sysinfo = "0.30.5"
+time = { version = "0.3.32", features = ["serde"] }
 tokio = { version = "1.35.1", features = ["rt", "net", "time", "process"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
