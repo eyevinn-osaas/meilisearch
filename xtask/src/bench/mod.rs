@@ -1,6 +1,8 @@
+mod rebench;
+
 use std::collections::BTreeMap;
 use std::fmt::Display;
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -12,6 +14,9 @@ use sha2::Digest;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
+use tracing_trace::processor::span_stats::CallStats;
+
+use self::rebench::Criterion;
 
 pub fn default_http_addr() -> String {
     "127.0.0.1:7700".to_string()
@@ -138,6 +143,7 @@ pub enum Method {
     POST,
     PATCH,
     DELETE,
+    PUT,
 }
 
 impl From<Method> for reqwest::Method {
@@ -147,6 +153,7 @@ impl From<Method> for reqwest::Method {
             Method::POST => Self::POST,
             Method::PATCH => Self::PATCH,
             Method::DELETE => Self::DELETE,
+            Method::PUT => Self::PUT,
         }
     }
 }
@@ -224,15 +231,36 @@ async fn run_workload(
         tasks.push(run_workload_run(client, master_key, &workload, args, i).await?);
     }
 
+    let mut reports = Vec::with_capacity(workload.run_count as usize);
+
     for task in tasks {
-        task.await
-            .context("task panicked while processing report")?
-            .context("task failed while processing report")?;
+        reports.push(
+            task.await
+                .context("task panicked while processing report")?
+                .context("task failed while processing report")?,
+        );
     }
+
+    runs_to_rebench(&workload, client, files_to_callstat(reports)).await?;
 
     tracing::info!(workload = workload.name, "Successful workload");
 
     Ok(())
+}
+
+fn files_to_callstat(
+    reports: Vec<std::fs::File>,
+) -> impl Iterator<Item = anyhow::Result<BTreeMap<String, CallStats>>> {
+    reports.into_iter().map(|file| {
+        let mut map = BTreeMap::new();
+        for res in serde_json::Deserializer::from_reader(BufReader::new(file)).into_iter() {
+            let value: BTreeMap<String, CallStats> =
+                res.context("could not deserialize report file")?;
+
+            map.extend(value.into_iter());
+        }
+        Ok(map)
+    })
 }
 
 #[tracing::instrument(skip(client, assets), fields(asset_count = assets.len()))]
@@ -373,7 +401,7 @@ async fn run_workload_run(
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
-) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     delete_db();
     build_meilisearch().await?;
     let meilisearch = start_meilisearch(client, master_key, workload, &args.asset_folder).await?;
@@ -494,7 +522,7 @@ async fn run_commands(
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
-) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     let report_folder = &args.report_folder;
     let workload_name = &workload.name;
 
@@ -523,7 +551,7 @@ async fn stop_report(
     client: &reqwest::Client,
     filename: String,
     report_handle: tokio::task::JoinHandle<anyhow::Result<std::fs::File>>,
-) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     let response = client.delete(url_of("logs")).send().await.context("while stopping report")?;
     if !response.status().is_success() {
         bail!("received HTTP {} while stopping report", response.status())
@@ -537,16 +565,24 @@ async fn stop_report(
 
     file.rewind().context("while rewinding report file")?;
 
-    let process_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let process_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
         let span = tracing::info_span!("processing trace to report", filename);
         let _guard = span.enter();
         let report = tracing_trace::processor::span_stats::to_call_stats(
             tracing_trace::TraceReader::new(std::io::BufReader::new(file)),
         )
         .context("could not convert trace to report")?;
-
-        let mut output_file = std::io::BufWriter::new(std::fs::File::create(&filename).unwrap());
         let context = || format!("writing report to {filename}");
+
+        let mut output_file = std::io::BufWriter::new(
+            std::fs::File::options()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .read(true)
+                .open(&filename)
+                .with_context(context)?,
+        );
 
         for (key, value) in report {
             serde_json::to_writer(&mut output_file, &json!({key: value}))
@@ -554,12 +590,88 @@ async fn stop_report(
             writeln!(&mut output_file).with_context(context)?;
         }
         output_file.flush().with_context(context)?;
-        tracing::info!("success");
+        let mut output_file = output_file.into_inner().with_context(context)?;
 
-        Ok(())
+        output_file.rewind().context("could not rewind ouptut_file").with_context(context)?;
+
+        tracing::info!("success");
+        Ok(output_file)
     });
 
     Ok(process_handle)
+}
+
+async fn runs_to_rebench<'a>(
+    workload: &Workload,
+    client: &reqwest::Client,
+    reports: impl Iterator<Item = anyhow::Result<BTreeMap<String, CallStats>>>,
+) -> anyhow::Result<()> {
+    let environment = rebench::Environment::generate_from_current_config();
+
+    let (source, time) =
+        rebench::Source::from_repo(".").context("while getting source repository information")?;
+
+    let mut benchmark_data = rebench::BenchmarkData::new(environment, source, &workload.name, time);
+    benchmark_data.with_project("Meilisearch");
+    let mut benchmarks = BTreeMap::new();
+
+    benchmark_data.push_criterion(Criterion { id: 0, name: "time".into(), unit: "ns".into() });
+    benchmark_data.push_criterion(Criterion { id: 1, name: "calls".into(), unit: "".into() });
+
+    for (run_index, report) in reports.enumerate() {
+        let report = report?;
+        for (span, stats) in report {
+            let benchmark = benchmarks.entry(span.clone()).or_insert(rebench::Benchmark {
+                name: span.clone(),
+                suite: rebench::Suite {
+                    name: "Meilisearch".into(),
+                    desc: None,
+                    executor: rebench::Executor { name: "Meilisearch".into(), desc: None },
+                },
+                run_details: rebench::RunDetails {
+                    max_invocation_time: 0,
+                    min_iteration_time: 0,
+                    warmup: None,
+                },
+                desc: None,
+            });
+
+            let run_id = rebench::RunId {
+                benchmark: benchmark.clone(),
+                cmdline: Default::default(),
+                location: Default::default(),
+                var_value: None,
+                cores: None,
+                input_size: None,
+                extra_args: None,
+            };
+
+            let mut run = rebench::Run::new(run_id);
+
+            let mut point = rebench::DataPoint::new(run_index, 0);
+            point.add_point(rebench::Measure { criterion_id: 0, value: stats.ns as f64 });
+            point.add_point(rebench::Measure { criterion_id: 1, value: stats.nb as f64 });
+            run.add_data(point);
+            benchmark_data.push_run(run);
+        }
+    }
+
+    /// FIXME: fetch rebenchdb url
+    let response = client
+        .put("http://localhost:33333/rebenchdb/results")
+        .json(&benchmark_data)
+        .send()
+        .await
+        .context("could not send data to rebenchdb")?;
+    if !response.status().is_success() {
+        bail!(
+            "sending results to rebenchdb failed with HTTP {}: {}",
+            response.status(),
+            response.text().await.unwrap_or("unknown".to_string())
+        )
+    }
+
+    Ok(())
 }
 
 async fn start_report(
