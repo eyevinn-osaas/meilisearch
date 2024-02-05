@@ -15,6 +15,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 use tracing_trace::processor::span_stats::CallStats;
+use uuid::Uuid;
 
 use self::rebench::Criterion;
 
@@ -185,6 +186,10 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let filter: tracing_subscriber::filter::Targets =
         args.log_filter.parse().context("invalid --log-filter")?;
 
+    let env = rebench::Environment::generate_from_current_config();
+    let (source, commit_date) =
+        rebench::Source::from_repo(".").context("could not get repository information")?;
+
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer().with_span_events(FmtSpan::ENTER).with_filter(filter),
     );
@@ -198,6 +203,28 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let client = new_client(&master_key, Some(std::time::Duration::from_secs(60)))?;
 
     rt.block_on(async {
+        let response = client.put("http://localhost:3000/api/v1/machine").json(&json!({"hostname": env.hostname})).send().await.context("sending machine information")?;
+        if !response.status().is_success() {
+            bail!("could not send machine information: {} {}", response.status(), response.text().await.unwrap_or_else(|_| "unknown".into()));
+        }
+
+
+        let commit_message = source.commit_msg.split('\n').next().unwrap();
+
+        /// TODO: reason
+        let reason: Option<String> = None;
+        let response = client.put("http://localhost:3000/api/v1/invocation").json(&json!({"commit":
+        {"sha1": source.commit_id, "message": commit_message, "commit_date": commit_date, "branch": source.branch_or_tag },
+    "machine_hostname": env.hostname, "reason": reason })).send().await.context("sending invocation")?;
+
+        if !response.status().is_success() {
+            bail!("could not send new invocation: {}", response.text().await.unwrap_or_else(|_| "unknown".into()));
+        }
+
+        let invocation_uuid: Uuid = response.json().await.context("could not deserialize invocation response as JSON")?;
+
+
+
         tracing::info!(workload_count = args.workload_file.len(), "handling workload files");
         for workload_file in args.workload_file.iter() {
             let workload: Workload = serde_json::from_reader(
@@ -206,7 +233,7 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
             )
             .with_context(|| format!("error parsing {} as JSON", workload_file.display()))?;
 
-            run_workload(&client, &master_key, workload, &args).await?;
+            run_workload(&client, invocation_uuid, &master_key, workload, &args).await?;
         }
         Ok::<(), anyhow::Error>(())
     })?;
@@ -219,16 +246,34 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
 #[tracing::instrument(skip(client, workload, master_key, args), fields(workload = workload.name))]
 async fn run_workload(
     client: &reqwest::Client,
+    invocation_uuid: Uuid,
     master_key: &str,
     workload: Workload,
     args: &BenchDeriveArgs,
 ) -> anyhow::Result<()> {
     fetch_assets(client, &workload.assets, &args.asset_folder).await?;
 
+    let response = client
+        .put("http://localhost:3000/api/v1/workload")
+        .json(&json!({
+            "invocation_uuid": invocation_uuid,
+            "name": &workload.name,
+        }))
+        .send()
+        .await
+        .context("could not create new workload")?;
+
+    if !response.status().is_success() {
+        bail!("creating new workload failed: {}", response.text().await.unwrap())
+    }
+
+    let workload_uuid: Uuid =
+        response.json().await.context("could not deserialize JSON as UUID")?;
+
     let mut tasks = Vec::new();
 
     for i in 0..workload.run_count {
-        tasks.push(run_workload_run(client, master_key, &workload, args, i).await?);
+        tasks.push(run_workload_run(client, workload_uuid, master_key, &workload, args, i).await?);
     }
 
     let mut reports = Vec::with_capacity(workload.run_count as usize);
@@ -241,7 +286,7 @@ async fn run_workload(
         );
     }
 
-    runs_to_rebench(&workload, client, files_to_callstat(reports)).await?;
+    //runs_to_rebench(&workload, client, files_to_callstat(reports)).await?;
 
     tracing::info!(workload = workload.name, "Successful workload");
 
@@ -397,6 +442,7 @@ async fn download_asset(
 #[tracing::instrument(skip(client, workload, master_key, args), fields(workload = %workload.name))]
 async fn run_workload_run(
     client: &reqwest::Client,
+    workload_uuid: Uuid,
     master_key: &str,
     workload: &Workload,
     args: &BenchDeriveArgs,
@@ -405,7 +451,8 @@ async fn run_workload_run(
     delete_db();
     build_meilisearch().await?;
     let meilisearch = start_meilisearch(client, master_key, workload, &args.asset_folder).await?;
-    let processor = run_commands(client, master_key, workload, args, run_number).await?;
+    let processor =
+        run_commands(client, workload_uuid, master_key, workload, args, run_number).await?;
 
     kill_meilisearch(meilisearch).await;
 
@@ -518,6 +565,7 @@ fn delete_db() {
 
 async fn run_commands(
     client: &reqwest::Client,
+    workload_uuid: Uuid,
     master_key: &str,
     workload: &Workload,
     args: &BenchDeriveArgs,
@@ -542,13 +590,14 @@ async fn run_commands(
         run_batch(client, batch, &workload.assets, &args.asset_folder).await?;
     }
 
-    let processor = stop_report(client, report_filename, report_handle).await?;
+    let processor = stop_report(client, workload_uuid, report_filename, report_handle).await?;
 
     Ok(processor)
 }
 
 async fn stop_report(
     client: &reqwest::Client,
+    workload_uuid: Uuid,
     filename: String,
     report_handle: tokio::task::JoinHandle<anyhow::Result<std::fs::File>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
@@ -565,37 +614,57 @@ async fn stop_report(
 
     file.rewind().context("while rewinding report file")?;
 
-    let process_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
-        let span = tracing::info_span!("processing trace to report", filename);
-        let _guard = span.enter();
-        let report = tracing_trace::processor::span_stats::to_call_stats(
-            tracing_trace::TraceReader::new(std::io::BufReader::new(file)),
-        )
-        .context("could not convert trace to report")?;
-        let context = || format!("writing report to {filename}");
+    let process_handle = tokio::task::spawn({
+        let client = client.clone();
+        async move {
+            let span = tracing::info_span!("processing trace to report", filename);
+            let _guard = span.enter();
+            let report = tracing_trace::processor::span_stats::to_call_stats(
+                tracing_trace::TraceReader::new(std::io::BufReader::new(file)),
+            )
+            .context("could not convert trace to report")?;
+            let context = || format!("writing report to {filename}");
 
-        let mut output_file = std::io::BufWriter::new(
-            std::fs::File::options()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .read(true)
-                .open(&filename)
-                .with_context(context)?,
-        );
+            let response = client
+                .put("http://localhost:3000/api/v1/run")
+                .json(&json!({
+                    "workload_uuid": workload_uuid,
+                    "data": report
+                }))
+                .send()
+                .await
+                .context("sending new run")?;
 
-        for (key, value) in report {
-            serde_json::to_writer(&mut output_file, &json!({key: value}))
-                .context("serializing span stat")?;
-            writeln!(&mut output_file).with_context(context)?;
+            if !response.status().is_success() {
+                bail!(
+                    "sending new run failed: {}",
+                    response.text().await.unwrap_or_else(|_| "unkown".into())
+                )
+            }
+
+            let mut output_file = std::io::BufWriter::new(
+                std::fs::File::options()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .read(true)
+                    .open(&filename)
+                    .with_context(context)?,
+            );
+
+            for (key, value) in report {
+                serde_json::to_writer(&mut output_file, &json!({key: value}))
+                    .context("serializing span stat")?;
+                writeln!(&mut output_file).with_context(context)?;
+            }
+            output_file.flush().with_context(context)?;
+            let mut output_file = output_file.into_inner().with_context(context)?;
+
+            output_file.rewind().context("could not rewind ouptut_file").with_context(context)?;
+
+            tracing::info!("success");
+            Ok(output_file)
         }
-        output_file.flush().with_context(context)?;
-        let mut output_file = output_file.into_inner().with_context(context)?;
-
-        output_file.rewind().context("could not rewind ouptut_file").with_context(context)?;
-
-        tracing::info!("success");
-        Ok(output_file)
     });
 
     Ok(process_handle)
@@ -649,12 +718,14 @@ async fn runs_to_rebench<'a>(
             let mut run = rebench::Run::new(run_id);
 
             let mut point = rebench::DataPoint::new(run_index, 0);
-            point.add_point(rebench::Measure { criterion_id: 0, value: stats.ns as f64 });
-            point.add_point(rebench::Measure { criterion_id: 1, value: stats.nb as f64 });
+            point.add_point(rebench::Measure { criterion_id: 0, value: stats.time as f64 });
+            point.add_point(rebench::Measure { criterion_id: 1, value: stats.call_count as f64 });
             run.add_data(point);
             benchmark_data.push_run(run);
         }
     }
+
+    println!("{}", serde_json::to_string(&benchmark_data).unwrap());
 
     /// FIXME: fetch rebenchdb url
     let response = client
