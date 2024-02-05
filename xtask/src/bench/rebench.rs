@@ -1,6 +1,3 @@
-use std::path::Path;
-
-use git2::ErrorCode;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -56,10 +53,6 @@ impl BenchmarkData {
 
     pub fn push_criterion(&mut self, criteria: Criterion) {
         self.criteria.push(criteria);
-    }
-
-    pub fn end_time(&mut self, end_time: OffsetDateTime) {
-        self.end_time = Some(end_time);
     }
 }
 
