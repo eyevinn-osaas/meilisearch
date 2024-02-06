@@ -505,6 +505,7 @@ async fn start_meilisearch(
 
     command.arg("--db-path").arg("./_xtask_benchmark.ms");
     command.arg("--master-key").arg(master_key);
+    command.arg("--experimental-enable-logs-route");
 
     for extra_arg in workload.extra_cli_args.iter() {
         command.arg(extra_arg);
