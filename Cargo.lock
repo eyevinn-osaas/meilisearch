@@ -6669,7 +6669,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "git2",
- "meilisearch-auth",
  "reqwest",
  "serde",
  "serde_json",

@@ -45,16 +45,32 @@ pub struct BenchDeriveArgs {
     workload_file: Vec<PathBuf>,
 
     /// Directory to output reports.
-    #[arg(short, long, default_value_t = default_report_folder())]
+    #[arg(long, default_value_t = default_report_folder())]
     report_folder: String,
 
     /// Directory to store the remote assets.
-    #[arg(short, long, default_value_t = default_asset_folder())]
+    #[arg(long, default_value_t = default_asset_folder())]
     asset_folder: String,
 
     /// Log directives
     #[arg(short, long, default_value_t = default_log_filter())]
     log_filter: String,
+
+    /// Benchmark dashboard API key
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Meilisearch master keys
+    #[arg(long)]
+    master_key: Option<String>,
+
+    /// Authentication bearer for fetching assets
+    #[arg(long)]
+    assets_key: Option<String>,
+
+    /// Reason for the benchmark invocation
+    #[arg(short, long)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -168,15 +184,18 @@ pub enum SyncMode {
 }
 
 fn new_client(
-    master_key: &str,
+    api_key: Option<&str>,
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.append(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {master_key}"))
-            .context("Invalid authorization header")?,
-    );
+    if let Some(api_key) = api_key {
+        headers.append(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .context("Invalid authorization header")?,
+        );
+    }
+
     let client = reqwest::ClientBuilder::new().default_headers(headers);
     let client = if let Some(timeout) = timeout { client.timeout(timeout) } else { client };
     Ok(client.build()?)
@@ -198,12 +217,22 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
     let _scope = rt.enter();
 
-    let master_key = meilisearch_auth::generate_master_key();
+    let assets_client =
+        new_client(args.assets_key.as_deref(), Some(std::time::Duration::from_secs(120)))?;
 
-    let client = new_client(&master_key, Some(std::time::Duration::from_secs(60)))?;
+    let dashboard_client =
+        new_client(args.api_key.as_deref(), Some(std::time::Duration::from_secs(60)))?;
+
+    // reporting uses its own client because keeping the stream open to wait for entries
+    // blocks any other requests
+    // Also we don't want any pesky timeout because we don't know how much time it will take to recover the full trace
+    let logs_client = new_client(args.master_key.as_deref(), None)?;
+
+    let meili_client =
+        new_client(args.master_key.as_deref(), Some(std::time::Duration::from_secs(60)))?;
 
     rt.block_on(async {
-        let response = client.put("http://localhost:3000/api/v1/machine").json(&json!({"hostname": env.hostname})).send().await.context("sending machine information")?;
+        let response = dashboard_client.put(dashboard_url_of("machine")).json(&json!({"hostname": env.hostname})).send().await.context("sending machine information")?;
         if !response.status().is_success() {
             bail!("could not send machine information: {} {}", response.status(), response.text().await.unwrap_or_else(|_| "unknown".into()));
         }
@@ -211,9 +240,8 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
 
         let commit_message = source.commit_msg.split('\n').next().unwrap();
 
-        /// TODO: reason
-        let reason: Option<String> = None;
-        let response = client.put("http://localhost:3000/api/v1/invocation").json(&json!({"commit":
+        let reason: Option<&str> = args.reason.as_deref();
+        let response = dashboard_client.put(dashboard_url_of("invocation")).json(&json!({"commit":
         {"sha1": source.commit_id, "message": commit_message, "commit_date": commit_date, "branch": source.branch_or_tag },
     "machine_hostname": env.hostname, "reason": reason })).send().await.context("sending invocation")?;
 
@@ -233,7 +261,7 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
             )
             .with_context(|| format!("error parsing {} as JSON", workload_file.display()))?;
 
-            run_workload(&client, invocation_uuid, &master_key, workload, &args).await?;
+            run_workload(&assets_client, &dashboard_client, &logs_client, &meili_client, invocation_uuid, args.master_key.as_deref(), workload, &args).await?;
         }
         Ok::<(), anyhow::Error>(())
     })?;
@@ -243,18 +271,22 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tracing::instrument(skip(client, workload, master_key, args), fields(workload = workload.name))]
+#[allow(clippy::too_many_arguments)] // not best code quality, but this is a benchmark runner
+#[tracing::instrument(skip(assets_client, dashboard_client, logs_client, meili_client, workload, master_key, args), fields(workload = workload.name))]
 async fn run_workload(
-    client: &reqwest::Client,
+    assets_client: &reqwest::Client,
+    dashboard_client: &reqwest::Client,
+    logs_client: &reqwest::Client,
+    meili_client: &reqwest::Client,
     invocation_uuid: Uuid,
-    master_key: &str,
+    master_key: Option<&str>,
     workload: Workload,
     args: &BenchDeriveArgs,
 ) -> anyhow::Result<()> {
-    fetch_assets(client, &workload.assets, &args.asset_folder).await?;
+    fetch_assets(assets_client, &workload.assets, &args.asset_folder).await?;
 
-    let response = client
-        .put("http://localhost:3000/api/v1/workload")
+    let response = dashboard_client
+        .put(dashboard_url_of("workload"))
         .json(&json!({
             "invocation_uuid": invocation_uuid,
             "name": &workload.name,
@@ -273,7 +305,19 @@ async fn run_workload(
     let mut tasks = Vec::new();
 
     for i in 0..workload.run_count {
-        tasks.push(run_workload_run(client, workload_uuid, master_key, &workload, args, i).await?);
+        tasks.push(
+            run_workload_run(
+                dashboard_client,
+                logs_client,
+                meili_client,
+                workload_uuid,
+                master_key,
+                &workload,
+                args,
+                i,
+            )
+            .await?,
+        );
     }
 
     let mut reports = Vec::with_capacity(workload.run_count as usize);
@@ -439,20 +483,32 @@ async fn download_asset(
     Ok(())
 }
 
-#[tracing::instrument(skip(client, workload, master_key, args), fields(workload = %workload.name))]
+#[allow(clippy::too_many_arguments)] // not best code quality, but this is a benchmark runner
+#[tracing::instrument(skip(dashboard_client, logs_client, meili_client, workload, master_key, args), fields(workload = %workload.name))]
 async fn run_workload_run(
-    client: &reqwest::Client,
+    dashboard_client: &reqwest::Client,
+    logs_client: &reqwest::Client,
+    meili_client: &reqwest::Client,
     workload_uuid: Uuid,
-    master_key: &str,
+    master_key: Option<&str>,
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     delete_db();
     build_meilisearch().await?;
-    let meilisearch = start_meilisearch(client, master_key, workload, &args.asset_folder).await?;
-    let processor =
-        run_commands(client, workload_uuid, master_key, workload, args, run_number).await?;
+    let meilisearch =
+        start_meilisearch(meili_client, master_key, workload, &args.asset_folder).await?;
+    let processor = run_commands(
+        dashboard_client,
+        logs_client,
+        meili_client,
+        workload_uuid,
+        workload,
+        args,
+        run_number,
+    )
+    .await?;
 
     kill_meilisearch(meilisearch).await;
 
@@ -489,7 +545,7 @@ async fn build_meilisearch() -> anyhow::Result<()> {
 #[tracing::instrument(skip(client, master_key, workload), fields(workload = workload.name))]
 async fn start_meilisearch(
     client: &reqwest::Client,
-    master_key: &str,
+    master_key: Option<&str>,
     workload: &Workload,
     asset_folder: &str,
 ) -> anyhow::Result<tokio::process::Child> {
@@ -504,7 +560,9 @@ async fn start_meilisearch(
         .arg("--");
 
     command.arg("--db-path").arg("./_xtask_benchmark.ms");
-    command.arg("--master-key").arg(master_key);
+    if let Some(master_key) = master_key {
+        command.arg("--master-key").arg(master_key);
+    }
     command.arg("--experimental-enable-logs-route");
 
     for extra_arg in workload.extra_cli_args.iter() {
@@ -565,9 +623,10 @@ fn delete_db() {
 }
 
 async fn run_commands(
-    client: &reqwest::Client,
+    dashboard_client: &reqwest::Client,
+    logs_client: &reqwest::Client,
+    meili_client: &reqwest::Client,
     workload_uuid: Uuid,
-    master_key: &str,
     workload: &Workload,
     args: &BenchDeriveArgs,
     run_number: u16,
@@ -581,28 +640,35 @@ async fn run_commands(
     let trace_filename = format!("{report_folder}/{workload_name}-{run_number}-trace.json");
     let report_filename = format!("{report_folder}/{workload_name}-{run_number}-report.json");
 
-    let report_handle = start_report(master_key, trace_filename).await?;
+    let report_handle = start_report(logs_client, trace_filename).await?;
 
     for batch in workload
         .commands
         .as_slice()
         .split_inclusive(|command| !matches!(command.synchronous, SyncMode::DontWait))
     {
-        run_batch(client, batch, &workload.assets, &args.asset_folder).await?;
+        run_batch(meili_client, batch, &workload.assets, &args.asset_folder).await?;
     }
 
-    let processor = stop_report(client, workload_uuid, report_filename, report_handle).await?;
+    let processor =
+        stop_report(dashboard_client, logs_client, workload_uuid, report_filename, report_handle)
+            .await?;
 
     Ok(processor)
 }
 
 async fn stop_report(
-    client: &reqwest::Client,
+    dashboard_client: &reqwest::Client,
+    logs_client: &reqwest::Client,
     workload_uuid: Uuid,
     filename: String,
     report_handle: tokio::task::JoinHandle<anyhow::Result<std::fs::File>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
-    let response = client.delete(url_of("logs")).send().await.context("while stopping report")?;
+    let response = logs_client
+        .delete(meili_url_of("logs/stream"))
+        .send()
+        .await
+        .context("while stopping report")?;
     if !response.status().is_success() {
         bail!("received HTTP {} while stopping report", response.status())
     }
@@ -616,7 +682,7 @@ async fn stop_report(
     file.rewind().context("while rewinding report file")?;
 
     let process_handle = tokio::task::spawn({
-        let client = client.clone();
+        let dashboard_client = dashboard_client.clone();
         async move {
             let span = tracing::info_span!("processing trace to report", filename);
             let _guard = span.enter();
@@ -626,7 +692,7 @@ async fn stop_report(
             .context("could not convert trace to report")?;
             let context = || format!("writing report to {filename}");
 
-            let response = client
+            let response = dashboard_client
                 .put("http://localhost:3000/api/v1/run")
                 .json(&json!({
                     "workload_uuid": workload_uuid,
@@ -661,7 +727,7 @@ async fn stop_report(
             output_file.flush().with_context(context)?;
             let mut output_file = output_file.into_inner().with_context(context)?;
 
-            output_file.rewind().context("could not rewind ouptut_file").with_context(context)?;
+            output_file.rewind().context("could not rewind output_file").with_context(context)?;
 
             tracing::info!("success");
             Ok(output_file)
@@ -747,7 +813,7 @@ async fn runs_to_rebench<'a>(
 }
 
 async fn start_report(
-    master_key: &str,
+    logs_client: &reqwest::Client,
     filename: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     let report_file = std::fs::File::options()
@@ -759,13 +825,8 @@ async fn start_report(
         .with_context(|| format!("could not create file at {filename}"))?;
     let mut report_file = std::io::BufWriter::new(report_file);
 
-    // reporting uses its own client because keeping the stream open to wait for entries
-    // blocks any other requests
-    // Also we don't want any pesky timeout because we don't know how much time it will take to recover the full trace
-    let client = new_client(master_key, None)?;
-
-    let response = client
-        .post(url_of("logs"))
+    let response = logs_client
+        .post(meili_url_of("logs/stream"))
         .json(&json!({
             "mode": "profile",
             "target": "indexing::=trace"
@@ -777,15 +838,21 @@ async fn start_report(
     let code = response.status();
     if code.is_client_error() {
         tracing::error!(%code, "request error when trying to start report");
-        let response: serde_json::Value =
-            response.json().await.context("could not deserialize response as JSON")?;
+        let response: serde_json::Value = response
+            .json()
+            .await
+            .context("could not deserialize response as JSON")
+            .context("response error when trying to start report")?;
         bail!(
             "request error when trying to start report: server responded with error code {code} and '{response}'"
         )
     } else if code.is_server_error() {
         tracing::error!(%code, "server error when trying to start report");
-        let response: serde_json::Value =
-            response.json().await.context("could not deserialize response as JSON")?;
+        let response: serde_json::Value = response
+            .json()
+            .await
+            .context("could not deserialize response as JSON")
+            .context("response error trying to start report")?;
         bail!("server error when trying to start report: server responded with error code {code} and '{response}'")
     }
 
@@ -841,12 +908,15 @@ async fn run_batch(
 async fn wait_for_tasks(client: &reqwest::Client) -> anyhow::Result<()> {
     loop {
         let response = client
-            .get(url_of("tasks?statuses=enqueued,processing"))
+            .get(meili_url_of("tasks?statuses=enqueued,processing"))
             .send()
             .await
             .context("Could not wait for tasks")?;
-        let response: serde_json::Value =
-            response.json().await.context("Could not deserialize response to JSON")?;
+        let response: serde_json::Value = response
+            .json()
+            .await
+            .context("could not deserialize response to JSON")
+            .context("Could not wait for tasks")?;
         match response.get("total") {
             Some(serde_json::Value::Number(number)) => {
                 let number = number.as_u64().with_context(|| {
@@ -887,7 +957,7 @@ async fn run_command(
         .with_context(|| format!("while getting body for command {command}"))?;
 
     let response = client
-        .request(command.method.into(), url_of(&command.route))
+        .request(command.method.into(), meili_url_of(&command.route))
         .json(&body)
         .send()
         .await
@@ -896,19 +966,29 @@ async fn run_command(
     let code = response.status();
     if code.is_client_error() {
         tracing::error!(%command, %code, "error in workload file");
-        let response: serde_json::Value =
-            response.json().await.context("Could not deserialize response as JSON")?;
+        let response: serde_json::Value = response
+            .json()
+            .await
+            .context("could not deserialize response as JSON")
+            .context("parsing error in workload file when sending command")?;
         bail!("error in workload file: server responded with error code {code} and '{response}'")
     } else if code.is_server_error() {
         tracing::error!(%command, %code, "server error");
-        let response: serde_json::Value =
-            response.json().await.context("Could not deserialize response as JSON")?;
+        let response: serde_json::Value = response
+            .json()
+            .await
+            .context("could not deserialize response as JSON")
+            .context("parsing server error when sending command")?;
         bail!("server error: server responded with error code {code} and '{response}'")
     }
 
     Ok(())
 }
 
-fn url_of(route: &str) -> String {
+fn meili_url_of(route: &str) -> String {
     format!("http://127.0.0.1:7700/{route}")
+}
+
+fn dashboard_url_of(route: &str) -> String {
+    format!("http://127.0.0.1:3000/api/v1/{route}")
 }
