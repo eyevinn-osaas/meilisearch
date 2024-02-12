@@ -261,8 +261,7 @@ fn spawn_extraction_task<FE, FS, M>(
     let current_span = tracing::Span::current();
 
     rayon::spawn(move || {
-        let child_span =
-            tracing::trace_span!(target: "", parent: &current_span, "extract_multiple_chunks");
+        let child_span = tracing::trace_span!(target: "indexing::extract::details", parent: &current_span, "extract_multiple_chunks");
         let _entered = child_span.enter();
         puffin::profile_scope!("extract_multiple_chunksdexing::details, ", name);
         let chunks: Result<M> =
@@ -271,7 +270,7 @@ fn spawn_extraction_task<FE, FS, M>(
 
         rayon::spawn(move || match chunks {
             Ok(chunks) => {
-                let child_span = tracing::trace_span!(target: "", parent: &current_span, "merge_multiple_chunks");
+                let child_span = tracing::trace_span!(target: "indexing::extract::details", parent: &current_span, "merge_multiple_chunks");
                 let _entered = child_span.enter();
                 debug!(database = name, "merge");
                 puffin::profile_scope!("merge_multiple_chunks", name);
