@@ -295,7 +295,7 @@ pub(crate) fn write_typed_chunk_into_index(
             is_merged_database = true;
         }
         TypedChunk::FieldIdFacetIsEmptyDocids(facet_id_is_empty_docids) => {
-            let span = tracing::trace_span!(target: "profile::indexing::write_db", "field_id_facet_is_empty_docids");
+            let span = tracing::trace_span!(target: "indexing::write_db", "field_id_facet_is_empty_docids");
             let _entered = span.enter();
             append_entries_into_database(
                 facet_id_is_empty_docids,
