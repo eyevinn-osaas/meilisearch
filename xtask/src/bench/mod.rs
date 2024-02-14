@@ -693,7 +693,7 @@ async fn stop_report(
             let context = || format!("writing report to {filename}");
 
             let response = dashboard_client
-                .put("http://localhost:3000/api/v1/run")
+                .put(dashboard_url_of("run"))
                 .json(&json!({
                     "workload_uuid": workload_uuid,
                     "data": report
