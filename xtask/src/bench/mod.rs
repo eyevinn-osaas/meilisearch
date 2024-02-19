@@ -41,7 +41,7 @@ pub struct BenchDeriveArgs {
     /// to run multiple workloads in the specified order.
     ///
     /// Each workload run will get its own report file.
-    #[arg(value_name = "WORKLOAD_FILE", last = true)]
+    #[arg(value_name = "WORKLOAD_FILE", last = false)]
     workload_file: Vec<PathBuf>,
 
     /// Directory to output reports.
