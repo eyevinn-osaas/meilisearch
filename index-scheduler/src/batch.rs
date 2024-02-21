@@ -628,8 +628,6 @@ impl IndexScheduler {
             self.breakpoint(crate::Breakpoint::InsideProcessBatch);
         }
 
-        std::thread::sleep_ms(4000);
-
         puffin::profile_function!(batch.to_string());
 
         match batch {
