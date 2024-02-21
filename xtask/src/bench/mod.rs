@@ -232,43 +232,158 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
         new_client(args.master_key.as_deref(), Some(std::time::Duration::from_secs(60)))?;
 
     rt.block_on(async {
-        let response = dashboard_client.put(dashboard_url_of("machine")).json(&json!({"hostname": env.hostname})).send().await.context("sending machine information")?;
+        let response = dashboard_client
+            .put(dashboard_url_of("machine"))
+            .json(&json!({"hostname": env.hostname}))
+            .send()
+            .await
+            .context("sending machine information")?;
         if !response.status().is_success() {
-            bail!("could not send machine information: {} {}", response.status(), response.text().await.unwrap_or_else(|_| "unknown".into()));
+            bail!(
+                "could not send machine information: {} {}",
+                response.status(),
+                response.text().await.unwrap_or_else(|_| "unknown".into())
+            );
         }
-
 
         let commit_message = source.commit_msg.split('\n').next().unwrap();
-
+        let max_workloads = args.workload_file.len();
         let reason: Option<&str> = args.reason.as_deref();
-        let response = dashboard_client.put(dashboard_url_of("invocation")).json(&json!({"commit":
-        {"sha1": source.commit_id, "message": commit_message, "commit_date": commit_date, "branch": source.branch_or_tag },
-    "machine_hostname": env.hostname, "reason": reason })).send().await.context("sending invocation")?;
+        let response = dashboard_client
+            .put(dashboard_url_of("invocation"))
+            .json(&json!({
+                "commit": {
+                    "sha1": source.commit_id,
+                    "message": commit_message,
+                    "commit_date": commit_date,
+                    "branch": source.branch_or_tag
+                },
+                "machine_hostname": env.hostname,
+                "max_workloads": max_workloads,
+                "reason": reason
+            }))
+            .send()
+            .await
+            .context("sending invocation")?;
 
         if !response.status().is_success() {
-            bail!("could not send new invocation: {}", response.text().await.unwrap_or_else(|_| "unknown".into()));
+            bail!(
+                "could not send new invocation: {}",
+                response.text().await.unwrap_or_else(|_| "unknown".into())
+            );
         }
 
-        let invocation_uuid: Uuid = response.json().await.context("could not deserialize invocation response as JSON")?;
+        let invocation_uuid: Uuid =
+            response.json().await.context("could not deserialize invocation response as JSON")?;
 
-
+        tokio::spawn({
+            let dashboard_client = dashboard_client.clone();
+            async move {
+                tracing::info!("press Ctrl-C to cancel the invocation");
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        tracing::info!(%invocation_uuid, "received Ctrl-C, cancelling invocation");
+                        mark_as_failed(dashboard_client, invocation_uuid, None).await;
+                    }
+                    Err(error) => tracing::warn!(
+                        error = &error as &dyn std::error::Error,
+                        "Failed to listen to Ctrl-C signal, invocation won't be canceled on Ctrl-C"
+                    ),
+                }
+            }
+        });
 
         tracing::info!(workload_count = args.workload_file.len(), "handling workload files");
-        for workload_file in args.workload_file.iter() {
-            let workload: Workload = serde_json::from_reader(
-                std::fs::File::open(workload_file)
-                    .with_context(|| format!("error opening {}", workload_file.display()))?,
-            )
-            .with_context(|| format!("error parsing {} as JSON", workload_file.display()))?;
+        let workload_runs = tokio::spawn(
+            {
+                let dashboard_client = dashboard_client.clone();
+                async move {
+            for workload_file in args.workload_file.iter() {
+                let workload: Workload = serde_json::from_reader(
+                    std::fs::File::open(workload_file)
+                        .with_context(|| format!("error opening {}", workload_file.display()))?,
+                )
+                .with_context(|| format!("error parsing {} as JSON", workload_file.display()))?;
 
-            run_workload(&assets_client, &dashboard_client, &logs_client, &meili_client, invocation_uuid, args.master_key.as_deref(), workload, &args).await?;
+                run_workload(
+                    &assets_client,
+                    &dashboard_client,
+                    &logs_client,
+                    &meili_client,
+                    invocation_uuid,
+                    args.master_key.as_deref(),
+                    workload,
+                    &args,
+                )
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }});
+
+        match workload_runs.await {
+            Ok(Ok(_)) => Ok::<(), anyhow::Error>(()),
+            Ok(Err(error)) => {
+                tracing::error!(%invocation_uuid, error = %error, "invocation failed, attempting to report the failure to dashboard");
+                mark_as_failed(dashboard_client, invocation_uuid, Some(error.to_string())).await;
+                tracing::warn!(%invocation_uuid, "invocation marked as failed following error");
+                Err(error)
+            },
+            Err(join_error) => {
+                tracing::error!("join error, cancelling invocation");
+
+
+                match join_error.try_into_panic() {
+                    Ok(panic) => {
+                        tracing::error!("invocation panicked, attempting to report the failure to dashboard");
+                        mark_as_failed(dashboard_client, invocation_uuid, Some("Panicked".into())).await;
+                        std::panic::resume_unwind(panic)
+                    }
+                    Err(_) => {
+                        tracing::error!("task was canceled");
+                        mark_as_failed(dashboard_client, invocation_uuid, None).await;
+                        panic!("unexpected task abort")
+                    }
+                }
+            },
         }
-        Ok::<(), anyhow::Error>(())
+
     })?;
 
     tracing::info!("Success");
 
     Ok(())
+}
+
+async fn mark_as_failed(
+    dashboard_client: reqwest::Client,
+    invocation_uuid: Uuid,
+    failure_reason: Option<String>,
+) {
+    let response = dashboard_client
+        .post(dashboard_url_of("cancel-invocation"))
+        .json(&json!({
+            "invocation_uuid": invocation_uuid,
+            "failure_reason": failure_reason,
+        }))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(response_error) => {
+            tracing::error!(error = &response_error as &dyn std::error::Error, %invocation_uuid, "could not mark invocation as failed");
+            return;
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::error!(
+            %invocation_uuid,
+            "could not mark invocation as failed: {}",
+            response.text().await.unwrap()
+        );
+        return;
+    }
+    tracing::warn!(%invocation_uuid, "marked invocation as failed or canceled");
 }
 
 #[allow(clippy::too_many_arguments)] // not best code quality, but this is a benchmark runner
@@ -290,6 +405,7 @@ async fn run_workload(
         .json(&json!({
             "invocation_uuid": invocation_uuid,
             "name": &workload.name,
+            "max_runs": workload.run_count,
         }))
         .send()
         .await
