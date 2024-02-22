@@ -31,6 +31,66 @@ pub fn default_log_filter() -> String {
     "info".into()
 }
 
+pub fn default_dashboard_url() -> String {
+    "http://localhost:3000".into()
+}
+
+#[derive(Debug, Clone)]
+pub struct Client {
+    base_url: Option<String>,
+    client: reqwest::Client,
+}
+
+impl Client {
+    pub fn new(
+        base_url: Option<String>,
+        api_key: Option<&str>,
+        timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(api_key) = api_key {
+            headers.append(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                    .context("Invalid authorization header")?,
+            );
+        }
+
+        let client = reqwest::ClientBuilder::new().default_headers(headers);
+        let client = if let Some(timeout) = timeout { client.timeout(timeout) } else { client };
+        let client = client.build()?;
+        Ok(Self { base_url, client })
+    }
+
+    pub fn request(&self, method: reqwest::Method, route: &str) -> reqwest::RequestBuilder {
+        if let Some(base_url) = &self.base_url {
+            if route.is_empty() {
+                self.client.request(method, base_url)
+            } else {
+                self.client.request(method, format!("{}/{}", base_url, route))
+            }
+        } else {
+            self.client.request(method, route)
+        }
+    }
+
+    pub fn get(&self, route: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, route)
+    }
+
+    pub fn put(&self, route: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PUT, route)
+    }
+
+    pub fn post(&self, route: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, route)
+    }
+
+    pub fn delete(&self, route: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::DELETE, route)
+    }
+}
+
 /// Run benchmarks from a workload
 #[derive(Parser, Debug)]
 pub struct BenchDeriveArgs {
@@ -40,6 +100,10 @@ pub struct BenchDeriveArgs {
     /// Each workload run will get its own report file.
     #[arg(value_name = "WORKLOAD_FILE", last = false)]
     workload_file: Vec<PathBuf>,
+
+    /// URL of the dashboard.
+    #[arg(long, default_value_t = default_dashboard_url())]
+    dashboard_url: String,
 
     /// Directory to output reports.
     #[arg(long, default_value_t = default_report_folder())]
@@ -180,24 +244,6 @@ pub enum SyncMode {
     WaitForTask,
 }
 
-fn new_client(
-    api_key: Option<&str>,
-    timeout: Option<std::time::Duration>,
-) -> anyhow::Result<reqwest::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(api_key) = api_key {
-        headers.append(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .context("Invalid authorization header")?,
-        );
-    }
-
-    let client = reqwest::ClientBuilder::new().default_headers(headers);
-    let client = if let Some(timeout) = timeout { client.timeout(timeout) } else { client };
-    Ok(client.build()?)
-}
-
 pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let filter: tracing_subscriber::filter::Targets =
         args.log_filter.parse().context("invalid --log-filter")?;
@@ -215,22 +261,32 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
     let _scope = rt.enter();
 
     let assets_client =
-        new_client(args.assets_key.as_deref(), Some(std::time::Duration::from_secs(120)))?;
+        Client::new(None, args.assets_key.as_deref(), Some(std::time::Duration::from_secs(120)))?;
 
-    let dashboard_client =
-        new_client(args.api_key.as_deref(), Some(std::time::Duration::from_secs(60)))?;
+    let dashboard_client = Client::new(
+        Some(format!("{}/api/v1", args.dashboard_url)),
+        args.api_key.as_deref(),
+        Some(std::time::Duration::from_secs(60)),
+    )?;
 
     // reporting uses its own client because keeping the stream open to wait for entries
     // blocks any other requests
     // Also we don't want any pesky timeout because we don't know how much time it will take to recover the full trace
-    let logs_client = new_client(args.master_key.as_deref(), None)?;
+    let logs_client = Client::new(
+        Some("http://127.0.0.1:7700/logs/stream".into()),
+        args.master_key.as_deref(),
+        None,
+    )?;
 
-    let meili_client =
-        new_client(args.master_key.as_deref(), Some(std::time::Duration::from_secs(60)))?;
+    let meili_client = Client::new(
+        Some("http://127.0.0.1:7700".into()),
+        args.master_key.as_deref(),
+        Some(std::time::Duration::from_secs(60)),
+    )?;
 
     rt.block_on(async {
         let response = dashboard_client
-            .put(dashboard_url_of("machine"))
+            .put("machine")
             .json(&json!({"hostname": env.hostname}))
             .send()
             .await
@@ -247,7 +303,7 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
         let max_workloads = args.workload_file.len();
         let reason: Option<&str> = args.reason.as_deref();
         let response = dashboard_client
-            .put(dashboard_url_of("invocation"))
+            .put("invocation")
             .json(&json!({
                 "commit": {
                     "sha1": source.commit_id,
@@ -354,12 +410,12 @@ pub fn run(args: BenchDeriveArgs) -> anyhow::Result<()> {
 }
 
 async fn mark_as_failed(
-    dashboard_client: reqwest::Client,
+    dashboard_client: Client,
     invocation_uuid: Uuid,
     failure_reason: Option<String>,
 ) {
     let response = dashboard_client
-        .post(dashboard_url_of("cancel-invocation"))
+        .post("cancel-invocation")
         .json(&json!({
             "invocation_uuid": invocation_uuid,
             "failure_reason": failure_reason,
@@ -388,10 +444,10 @@ async fn mark_as_failed(
 #[allow(clippy::too_many_arguments)] // not best code quality, but this is a benchmark runner
 #[tracing::instrument(skip(assets_client, dashboard_client, logs_client, meili_client, workload, master_key, args), fields(workload = workload.name))]
 async fn run_workload(
-    assets_client: &reqwest::Client,
-    dashboard_client: &reqwest::Client,
-    logs_client: &reqwest::Client,
-    meili_client: &reqwest::Client,
+    assets_client: &Client,
+    dashboard_client: &Client,
+    logs_client: &Client,
+    meili_client: &Client,
     invocation_uuid: Uuid,
     master_key: Option<&str>,
     workload: Workload,
@@ -400,7 +456,7 @@ async fn run_workload(
     fetch_assets(assets_client, &workload.assets, &args.asset_folder).await?;
 
     let response = dashboard_client
-        .put(dashboard_url_of("workload"))
+        .put("workload")
         .json(&json!({
             "invocation_uuid": invocation_uuid,
             "name": &workload.name,
@@ -454,7 +510,7 @@ async fn run_workload(
 
 #[tracing::instrument(skip(client, assets), fields(asset_count = assets.len()))]
 async fn fetch_assets(
-    client: &reqwest::Client,
+    client: &Client,
     assets: &BTreeMap<String, Asset>,
     asset_folder: &str,
 ) -> anyhow::Result<()> {
@@ -548,7 +604,7 @@ fn check_sha256(name: &str, asset: &Asset, mut file: std::fs::File) -> anyhow::R
 
 #[tracing::instrument(skip(client, asset, name), fields(asset = name))]
 async fn download_asset(
-    client: reqwest::Client,
+    client: Client,
     name: String,
     asset: Asset,
     src: String,
@@ -586,9 +642,9 @@ async fn download_asset(
 #[allow(clippy::too_many_arguments)] // not best code quality, but this is a benchmark runner
 #[tracing::instrument(skip(dashboard_client, logs_client, meili_client, workload, master_key, args), fields(workload = %workload.name))]
 async fn run_workload_run(
-    dashboard_client: &reqwest::Client,
-    logs_client: &reqwest::Client,
-    meili_client: &reqwest::Client,
+    dashboard_client: &Client,
+    logs_client: &Client,
+    meili_client: &Client,
     workload_uuid: Uuid,
     master_key: Option<&str>,
     workload: &Workload,
@@ -644,7 +700,7 @@ async fn build_meilisearch() -> anyhow::Result<()> {
 
 #[tracing::instrument(skip(client, master_key, workload), fields(workload = workload.name))]
 async fn start_meilisearch(
-    client: &reqwest::Client,
+    client: &Client,
     master_key: Option<&str>,
     workload: &Workload,
     asset_folder: &str,
@@ -679,7 +735,7 @@ async fn start_meilisearch(
 }
 
 async fn wait_for_health(
-    client: &reqwest::Client,
+    client: &Client,
     meilisearch: &mut tokio::process::Child,
     assets: &BTreeMap<String, Asset>,
     asset_folder: &str,
@@ -723,9 +779,9 @@ fn delete_db() {
 }
 
 async fn run_commands(
-    dashboard_client: &reqwest::Client,
-    logs_client: &reqwest::Client,
-    meili_client: &reqwest::Client,
+    dashboard_client: &Client,
+    logs_client: &Client,
+    meili_client: &Client,
     workload_uuid: Uuid,
     workload: &Workload,
     args: &BenchDeriveArgs,
@@ -758,17 +814,13 @@ async fn run_commands(
 }
 
 async fn stop_report(
-    dashboard_client: &reqwest::Client,
-    logs_client: &reqwest::Client,
+    dashboard_client: &Client,
+    logs_client: &Client,
     workload_uuid: Uuid,
     filename: String,
     report_handle: tokio::task::JoinHandle<anyhow::Result<std::fs::File>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
-    let response = logs_client
-        .delete(meili_url_of("logs/stream"))
-        .send()
-        .await
-        .context("while stopping report")?;
+    let response = logs_client.delete("").send().await.context("while stopping report")?;
     if !response.status().is_success() {
         bail!("received HTTP {} while stopping report", response.status())
     }
@@ -793,7 +845,7 @@ async fn stop_report(
             let context = || format!("writing report to {filename}");
 
             let response = dashboard_client
-                .put(dashboard_url_of("run"))
+                .put("run")
                 .json(&json!({
                     "workload_uuid": workload_uuid,
                     "data": report
@@ -838,7 +890,7 @@ async fn stop_report(
 }
 
 async fn start_report(
-    logs_client: &reqwest::Client,
+    logs_client: &Client,
     filename: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<std::fs::File>>> {
     let report_file = std::fs::File::options()
@@ -851,7 +903,7 @@ async fn start_report(
     let mut report_file = std::io::BufWriter::new(report_file);
 
     let response = logs_client
-        .post(meili_url_of("logs/stream"))
+        .post("")
         .json(&json!({
             "mode": "profile",
             "target": "indexing::=trace"
@@ -893,7 +945,7 @@ async fn start_report(
 }
 
 async fn run_batch(
-    client: &reqwest::Client,
+    client: &Client,
     batch: &[Command],
     assets: &BTreeMap<String, Asset>,
     asset_folder: &str,
@@ -930,10 +982,10 @@ async fn run_batch(
     Ok(())
 }
 
-async fn wait_for_tasks(client: &reqwest::Client) -> anyhow::Result<()> {
+async fn wait_for_tasks(client: &Client) -> anyhow::Result<()> {
     loop {
         let response = client
-            .get(meili_url_of("tasks?statuses=enqueued,processing"))
+            .get("tasks?statuses=enqueued,processing")
             .send()
             .await
             .context("could not wait for tasks")?;
@@ -971,7 +1023,7 @@ async fn wait_for_tasks(client: &reqwest::Client) -> anyhow::Result<()> {
 
 #[tracing::instrument(skip(client, command, assets, asset_folder), fields(command = %command))]
 async fn run_command(
-    client: reqwest::Client,
+    client: Client,
     mut command: Command,
     assets: &BTreeMap<String, Asset>,
     asset_folder: &str,
@@ -982,7 +1034,7 @@ async fn run_command(
         .with_context(|| format!("while getting body for command {command}"))?;
 
     let response = client
-        .request(command.method.into(), meili_url_of(&command.route))
+        .request(command.method.into(), &command.route)
         .json(&body)
         .send()
         .await
@@ -1008,12 +1060,4 @@ async fn run_command(
     }
 
     Ok(())
-}
-
-fn meili_url_of(route: &str) -> String {
-    format!("http://127.0.0.1:7700/{route}")
-}
-
-fn dashboard_url_of(route: &str) -> String {
-    format!("http://127.0.0.1:3000/api/v1/{route}")
 }
