@@ -23,39 +23,6 @@ pub struct BenchmarkData {
     pub project_name: Option<String>,
 }
 
-impl BenchmarkData {
-    pub fn new(
-        env: Environment,
-        source: Source,
-        experiment_name: impl AsRef<str>,
-        start_time: time::OffsetDateTime,
-    ) -> Self {
-        Self {
-            data: Vec::new(),
-            criteria: Vec::new(),
-            env,
-            source,
-            experiment_name: experiment_name.as_ref().to_string(),
-            experiment_description: None,
-            start_time,
-            end_time: None,
-            project_name: None,
-        }
-    }
-
-    pub fn with_project(&mut self, project: impl AsRef<str>) {
-        self.project_name = Some(project.as_ref().to_string());
-    }
-
-    pub fn push_run(&mut self, run: Run) {
-        self.data.push(run);
-    }
-
-    pub fn push_criterion(&mut self, criteria: Criterion) {
-        self.criteria.push(criteria);
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
@@ -67,16 +34,6 @@ pub struct Run {
     pub profile: Vec<ProfileData>,
     /// The id of your run
     pub run_id: RunId,
-}
-
-impl Run {
-    pub fn new(run_id: RunId) -> Self {
-        Self { points: Vec::new(), profile: Vec::new(), run_id }
-    }
-
-    pub fn add_data(&mut self, data_point: DataPoint) {
-        self.points.push(data_point)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -158,17 +115,6 @@ pub struct DataPoint {
     #[serde(rename = "m")]
     pub measures: Vec<Measure>,
 }
-
-impl DataPoint {
-    pub fn new(invocation: usize, iteration: usize) -> Self {
-        Self { invocation, iteration, measures: Vec::new() }
-    }
-
-    pub fn add_point(&mut self, measure: Measure) {
-        self.measures.push(measure);
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileElement {
@@ -226,6 +172,7 @@ impl Source {
         let remote = repo.find_remote(remote)?;
 
         let head = repo.head()?;
+
         let commit = head.peel_to_commit()?;
 
         let time = OffsetDateTime::from_unix_timestamp(commit.time().seconds()).unwrap();
