@@ -60,7 +60,7 @@ const MEILI_EXPERIMENTAL_MAX_NUMBER_OF_BATCHED_TASKS: &str =
 
 const DEFAULT_CONFIG_FILE_PATH: &str = "./config.toml";
 const DEFAULT_DB_PATH: &str = "./data.ms";
-const DEFAULT_HTTP_ADDR: &str = "localhost:7700";
+const DEFAULT_HTTP_ADDR: &str = "localhost:8080";
 const DEFAULT_ENV: &str = "development";
 const DEFAULT_HTTP_PAYLOAD_SIZE_LIMIT: &str = "100 MB";
 const DEFAULT_SNAPSHOT_DIR: &str = "snapshots/";

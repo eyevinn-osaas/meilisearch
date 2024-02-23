@@ -22,7 +22,7 @@ RUN     set -eux; \
 # Run
 FROM    alpine:3.16
 
-ENV     MEILI_HTTP_ADDR 0.0.0.0:7700
+ENV     MEILI_HTTP_ADDR 0.0.0.0:8080
 ENV     MEILI_SERVER_PROVIDER docker
 
 RUN     apk update --quiet \
@@ -42,7 +42,7 @@ RUN     ln -s /bin/meilisearch /meilisearch
 WORKDIR /meili_data
 
 
-EXPOSE  7700/tcp
+EXPOSE  8080/tcp
 
 ENTRYPOINT ["tini", "--"]
 CMD     /bin/meilisearch

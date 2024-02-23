@@ -1294,8 +1294,8 @@
       {
         "current": {
           "selected": false,
-          "text": "localhost:7700",
-          "value": "localhost:7700"
+          "text": "localhost:8080",
+          "value": "localhost:8080"
         },
         "datasource": {
           "type": "prometheus"

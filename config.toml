@@ -10,7 +10,7 @@ db_path = "./data.ms"
 env = "development"
 
 # The address on which the HTTP server will listen.
-http_addr = "localhost:7700"
+http_addr = "localhost:8080"
 
 # Sets the instance's master key, automatically protecting all routes except GET /health.
 # https://www.meilisearch.com/docs/learn/configuration/instance_options#master-key
